@@ -27,7 +27,7 @@ class BitObject:
         header = decompressed[:null_idx].decode()
         content = decompressed[null_idx + 1:]
 
-        obj_type, size = header.split(b" ") #split by space
+        obj_type, size = header.split(" ") #split by space
 
         return cls(obj_type, content)
     
@@ -103,7 +103,8 @@ class Commit(BitObject):
         tree_hash = None
         parent_hashes = []
         author = None 
-        commiter = None
+        committer = None
+        timestamp = None
         message_start = 0
         for i, line in enumerate(lines):
             if line.startswith("tree "): # start after 5 characters
@@ -116,12 +117,12 @@ class Commit(BitObject):
                 timestamp = int(author_parts[1])
             elif line.startswith("committer "):
                 committer_parts = line[10:].rsplit(" ", 2)
-                author = committer_parts[0]
+                committer = committer_parts[0]
             elif line == "":
                 message_start = i+1 #message starts form next line
                 break
         message = "\n".join(lines[message_start:])
-        commit = cls(tree_hash, parent_hashes, author, commiter, message, timestamp)
+        commit = cls(tree_hash, parent_hashes, author, committer, message, timestamp)
         return commit
 
          
@@ -240,9 +241,9 @@ class Repository:
     def load_object(self, obj_hash: str) -> BitObject:
         obj_dir = self.objects_dir / obj_hash[:2]
         obj_file = obj_dir / obj_hash[2:]
-
         if not obj_file.exists():
-            raise FileExistsError(f"Object {obj_hash} not found")
+            raise FileNotFoundError(f"Object {obj_hash} not found")
+
         return BitObject.deserialize(obj_file.read_bytes())
     def create_tree_from_index(self):
         index = self.load_index()
@@ -261,24 +262,28 @@ class Repository:
                 if dir_name not in dirs:
                     dirs[dir_name] = {}
                 current = dirs[dir_name]
-                for part in parts[1:-1]: # we use -1 becuase we dont want to include that, we only want direcories not the file name
+                for part in parts[1:-1]:
                     if part not in current:
                         current[part] = {}
                     current = current[part]
-                current[parts[-1]] = blob_hash # { filename : blob_hash}
-            def create_tree_recursive(entries_dict: Dict):
-                tree = Tree()
-                for name, blob_hash in entries_dict.items():
-                    if isinstance(blob_hash, str):  #if blob hash type is str, meaning it's a file
-                        tree.add_entry("100644", name, blob_hash) # 100644 indicates that it's a file
-                    if isinstance(blob_hash, dict): # if blob hash type is dict, meaning it's  a dir
-                        subtree_hash = create_tree_recursive(blob_hash)
-                        tree.add_entry("40000",name, subtree_hash) # 40000 indicates it's a dir
-                    return self.store_objects(tree)
-            root_entries = {**files}
-            for dir_name, dir_files in dirs.items():
-                root_entries[dir_name] = dir_files
-            return create_tree_recursive(root_entries)
+                current[parts[-1]] = blob_hash
+
+        def create_tree_recursive(entries_dict: Dict) -> str:
+            tree = Tree()
+            for name, blob_hash in sorted(entries_dict.items()):
+                if isinstance(blob_hash, str):
+                    tree.add_entry("100644", name, blob_hash)
+                elif isinstance(blob_hash, dict):
+                    subtree_hash = create_tree_recursive(blob_hash)
+                    tree.add_entry("40000", name, subtree_hash)
+
+            return self.store_objects(tree)
+
+        root_entries = {**files}
+        for dir_name, dir_contents in dirs.items():
+            root_entries[dir_name] = dir_contents
+
+        return create_tree_recursive(root_entries)
 
     def get_current_branch(self) -> str:
         if not self.head_file.exists():
@@ -327,7 +332,98 @@ class Repository:
         self.save_index({}) # wiped the index (remove the committed files from staging area)
         print(f"Created commit {commit_hash} on branch {current_branch}")
         return commit_hash
+    def get_files_from_tree_recursive(self, tree_hash: str, prefix: str= ""):
+        files = set()
+        if not tree_hash or tree_hash == "None":
+            return files
+        try:
+            tree_obj = self.load_object(tree_hash)
+            tree = Tree.from_content(tree_obj.content)
+            # tree = list<tuple<str, str, str>
+            for mode, name, obj_hash in tree.entries:
+                full_name = f"{prefix}{name}"
+                if mode.startswith("100"):
+                    files.add(full_name)
+                elif mode.startswith("400"):
+                    subtree_files = self.get_files_from_tree_recursive(
+                        obj_hash, f"{full_name}/"
+                    )
+                    files.update(subtree_files)
+        except Exception as e:
+            print(f"Warning could not read tree {tree_hash}: {e}")
 
+        return files
+
+
+    def checkout(self, branch: str, create_branch: bool):
+        #compute files to clear from previous commit
+        previous_branch = self.get_current_branch()
+        files_to_clear = set()
+        previous_commit_hash = None
+        try:
+            previous_commit_hash = self.get_branch_commit(previous_branch)
+            if previous_commit_hash:
+                prev_commit_object = self.load_object(previous_commit_hash)
+                prev_commit = Commit.from_content(prev_commit_object.content)
+                if prev_commit.tree_hash and prev_commit.tree_hash != "None":
+                    files_to_clear = self.get_files_from_tree_recursive(prev_commit.tree_hash)
+        except Exception:
+            files_to_clear = set()
+        #created a new branch
+        branch_file = self.heads_dir / branch
+        if not  branch_file.exists():
+            if create_branch:
+                if previous_commit_hash:
+                    self.set_branch_commit(branch, previous_commit_hash)
+                    print(f"Created new branch {branch}")
+                else:
+                     print("No commites yet, cannot create a branch")
+                     return
+            else:
+                print(f"Branch '{branch}' not found")
+                print(f"Use 'python main.py checkout -b {branch} to create and switch branch")
+                return
+        if not self.restore_working_directory(branch, files_to_clear):
+            return
+
+        self.head_file.write_text(f"ref: refs/heads/{branch}\n")
+        print(f"Switched to branch {branch}")
+
+    def restore_tree(self, tree_hash: str, path: Path):
+        tree_obj = self.load_object(tree_hash)
+        tree = Tree.from_content(tree_obj.content)
+        # tree = list<tuple<str, str, str>
+        for mode, name, obj_hash in tree.entries:
+            file_path = path / name
+            if mode.startswith("100"):
+                blob_obj = self.load_object(obj_hash)
+                blob = Blob(blob_obj.content)
+                file_path.write_bytes(blob.content)
+            elif mode.startswith("400"):
+                file_path.mkdir(exist_ok=True)
+                self.restore_tree(obj_hash, file_path)
+        
+
+    def restore_working_directory(self, branch: str, files_to_clear: set[str]) -> bool:
+        target_commit_hash = self.get_branch_commit(branch)
+        if not target_commit_hash:
+            # No commit on this branch yet: clear index and allow switching
+            self.save_index({})
+            return True
+        #remove files tracked by previous branch
+        for rel_path in sorted(files_to_clear):
+            file_path = self.path / rel_path
+            try:
+                if file_path.is_file():
+                    file_path.unlink()
+            except Exception:
+                pass
+        target_commit_obj = self.load_object(target_commit_hash)
+        target_commit = Commit.from_content(target_commit_obj.content)
+        if target_commit.tree_hash:
+            self.restore_tree(target_commit.tree_hash, self.path)
+        self.save_index({})
+        return True
 
 def main():
     parser = argparse.ArgumentParser(
@@ -350,7 +446,10 @@ def main():
     commit_parser.add_argument("-m", "--message", help="Commit message", required=True)
     commit_parser.add_argument("--author", help="Author name and email")
 
-    
+    #checkout command
+    checkout_parser = subparsers.add_parser("checkout", help="Move/Create a new branch")
+    checkout_parser.add_argument("branch", help="Branch to switch to")
+    checkout_parser.add_argument("-b", "--create-branch", action="store_true",help="Create and switch to a new branch") #creates a boolean value
     args = parser.parse_args()
     
     if not args.command:
@@ -375,7 +474,11 @@ def main():
                 return
             author = args.author or "Bit user <user@bit.com>"
             repo.commit(args.message, author)
-
+        elif args.command == "checkout":
+            if not repo.bit_dir.exists():
+                print("Not a bit repository")
+                return
+            repo.checkout(args.branch, args.create_branch)
 
 
     except Exception as e:
