@@ -155,7 +155,7 @@ class Repository:
         #create initial HEAD pointing to a branch
         self.head_file.write_text("ref: refs/heads/master\n")
         self.save_index({})
-        print(f"Initalized empyt Bit repository in {self.bit_dir}")
+        print(f"Initialized empyt Bit repository in {self.bit_dir}")
         return True
     
     def store_objects(self, obj: BitObject) -> str:
@@ -253,7 +253,7 @@ class Repository:
         dirs = {}
         files = {}
         for file_path, blob_hash in index.items():  #{"main.py": "20a878c274ab9a62fc0a88d8b56dd422b11e4ab7"}
-            parts = file_path.split("/")
+            parts = Path(file_path).parts
             if len(parts) == 1:
                 #meaning its a root file
                 files[parts[0]] = blob_hash #{"main.py": "20a878c274ab9a62fc0a88d8b56dd422b11e4ab7"}
@@ -416,6 +416,9 @@ class Repository:
             try:
                 if file_path.is_file():
                     file_path.unlink()
+                elif file_path.is_dir():
+                    if not any(file_path.iterdir()):
+                        file_path.rmdir() #remove empty directories
             except Exception:
                 pass
         target_commit_obj = self.load_object(target_commit_hash)
@@ -424,6 +427,162 @@ class Repository:
             self.restore_tree(target_commit.tree_hash, self.path)
         self.save_index({})
         return True
+    
+    def branch(self, branch_name,  delete: bool = False):
+        #delete
+        if delete and branch_name:
+            branch_file = self.heads_dir / branch_name
+            if branch_file.exists():
+                branch_file.unlink()
+                print(f"Deleted branch {branch_name}")
+            else:
+                print(f"Branch {branch_name} not found")
+            return
+        current_branch = self.get_current_branch()
+        if branch_name:
+            current_commit = self.get_branch_commit(current_branch)
+            if current_commit:
+                self.set_branch_commit(branch_name, current_commit)
+                print(f"Created branch {branch_name}")
+            else:
+                print(f"No commits yet, cannot create a new branch")
+        else:
+            branches = []
+            for branch_file in self.heads_dir.iterdir():
+                if branch_file.is_file():
+                    branches.append(branch_file.name)
+            for branch in sorted(branches):
+                current_marker = "* " if branch == current_branch else " "
+                print(f"{current_marker}{branch}")
+
+    def log(self, max_count: int = 10):
+        current_branch = self.get_current_branch()
+        commit_hash = self.get_branch_commit(current_branch)
+
+        if not commit_hash:
+            print("No commits yet!")
+            return
+        count = 0
+        while commit_hash and count < max_count: #while commit hash is present and count < max_count
+            commit_obj = self.load_object(commit_hash)
+            commit = Commit.from_content(commit_obj.content)
+            print(f"Commit: {commit_hash}")
+            print(f"Author: {commit.author}")
+            print(f"Date: {time.ctime(commit.timestamp)}")
+            print(f"\n    {commit.message}\n")
+            commit_hash = commit.parent_hashes[0] if commit.parent_hashes else None
+            count+=1
+
+    def build_index_from_tree(self, tree_hash: str, prefix: str=""):
+        index = {}
+        try:
+            tree_obj = self.load_object(tree_hash)
+            tree = Tree.from_content(tree_obj.content)
+            # tree = list<tuple<str, str, str>
+            for mode, name, obj_hash in tree.entries:
+                full_name = f"{prefix}{name}"
+                if mode.startswith("100"):
+                    index[full_name] = obj_hash
+                elif mode.startswith("400"):
+                    subindex = self.build_index_from_tree(
+                        obj_hash, f"{full_name}/"
+                    )
+                    index.update(subindex)
+        except Exception as e:
+            print(f"Warning could not read tree {tree_hash}: {e}")
+
+        return index
+    def get_all_files(self) -> List[Path]:
+        files = []
+
+        for item in self.path.rglob("*"):
+            if ".git" in item.parts or ".bit" in item.parts:
+                continue
+            if item.is_file():
+                files.append(item)
+        return files
+    def status(self):
+        # what branch are we on
+        current_branch = self.get_current_branch()
+        print(f"On branch {current_branch}")
+        index = self.load_index()
+        current_commit_hash = self.get_branch_commit(current_branch)
+        #build index of the latest commit
+        last_index_files = {}
+        
+        if current_commit_hash:
+            try:
+                commit_obj = self.load_object(current_commit_hash)
+                commit = Commit.from_content(commit_obj.content)
+                if commit.tree_hash:
+                    last_index_files = self.build_index_from_tree(commit.tree_hash)
+            except:
+                last_index_files = {}
+        # All the files present within the working directory
+        working_files = {} # file name -> hash
+        for item in self.get_all_files():
+            rel_path = str(item.relative_to(self.path))
+            try:
+                content = item.read_bytes()
+                blob = Blob(content)
+                working_files[rel_path] = blob.hash()
+            except Exception:
+                continue
+        staged_files = []
+        unstaged_files = []
+        untracked_files = []
+        deleted_files = []
+        # what files are stages for commit
+        for file_path in set(index.keys()) | set(last_index_files.keys()):
+            index_hash = index.get(file_path)
+            last_index_hash = last_index_files.get(file_path)
+
+            if index_hash and not last_index_hash:
+                staged_files.append(("new file", file_path))
+            elif index_hash and index_hash != last_index_hash:
+                staged_files.append(("modified", file_path))
+        if staged_files:
+            print("\nChanges to be committed")
+            for stage_status, file_path in sorted(staged_files):
+                print(f"   {stage_status}: {file_path}")
+
+        #what files have modified but not staged
+        for file_path, working_hash in working_files.items():
+
+            if file_path in index:
+                # compare against staged version
+                if working_hash != index[file_path]:
+                    unstaged_files.append(file_path)
+
+            elif file_path in last_index_files:
+                # compare against latest commit
+                if working_hash != last_index_files[file_path]:
+                    unstaged_files.append(file_path)
+        if unstaged_files:
+            print("\nChanges not staged for commit:")
+            for file_path in sorted(unstaged_files):
+                print(f"   modified : {file_path}")
+
+        # what files are untracked
+        for file_path in working_files:
+            if file_path not in index and file_path not in last_index_files:
+                untracked_files.append(file_path)
+        if untracked_files:
+            print("\nUntracked files:")
+            for file_path in sorted(untracked_files):
+                print(f"   {file_path}")
+        # what files have been deleted
+        for file_path in set(index.keys()) | set(last_index_files.keys()):
+            if file_path not in working_files:
+                deleted_files.append(file_path)
+        if deleted_files:
+            print("\nDeleted files:")
+            for file_path in sorted(deleted_files):
+                print(f"  deleted: {file_path}")
+        if not staged_files and not unstaged_files and not deleted_files and not untracked_files:
+            print("Nothing to commit, working tree clean ")
+            
+        
 
 def main():
     parser = argparse.ArgumentParser(
@@ -450,6 +609,20 @@ def main():
     checkout_parser = subparsers.add_parser("checkout", help="Move/Create a new branch")
     checkout_parser.add_argument("branch", help="Branch to switch to")
     checkout_parser.add_argument("-b", "--create-branch", action="store_true",help="Create and switch to a new branch") #creates a boolean value
+    # Branch command
+    branch_parser = subparsers.add_parser("branch", help="List or manage branches")
+    branch_parser.add_argument(
+        "name",
+        nargs='?'
+    )
+    branch_parser.add_argument("-d", "--delete", action="store_true", help="Delete the branch")
+
+    # log command
+    log_parser = subparsers.add_parser("log", help="Show commit history")
+    log_parser.add_argument("-n", "--max-count", type=int, default=10, help="Limit commits displayed")
+
+    #status command
+    status_parser = subparsers.add_parser("status", help="show repository status")
     args = parser.parse_args()
     
     if not args.command:
@@ -479,7 +652,21 @@ def main():
                 print("Not a bit repository")
                 return
             repo.checkout(args.branch, args.create_branch)
-
+        elif args.command == "branch":
+            if not repo.bit_dir.exists():
+                print("Not a bit repository")
+                return
+            repo.branch(args.name, args.delete)
+        elif args.command == "log":
+            if not repo.bit_dir.exists():
+                print("Not a bit repository")
+                return
+            repo.log(args.max_count)
+        elif args.command == "status":
+            if not repo.bit_dir.exists():
+                print("Not a bit repository")
+                return
+            repo.status()
 
     except Exception as e:
         print(f"Error {e}")
